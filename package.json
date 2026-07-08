@@ -1,0 +1,22 @@
+{
+  "name": "openchamber-relay",
+  "private": true,
+  "type": "module",
+  "description": "Self-hostable OpenChamber private relay (Cloudflare Worker + Durable Object).",
+  "scripts": {
+    "dev": "wrangler dev src/index.ts --port 8788",
+    "deploy": "wrangler deploy",
+    "check": "tsc --noEmit",
+    "smoke": "bun run scripts/smoke.ts",
+    "test": "bun test scripts/usage-accumulator.test.ts"
+  },
+  "dependencies": {
+    "hono": "^4.7.5",
+    "zod": "^3.24.2"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^4.20250303.0",
+    "typescript": "^5.8.2",
+    "wrangler": "^4.4.0"
+  }
+}

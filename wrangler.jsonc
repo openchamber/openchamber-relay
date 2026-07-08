@@ -1,0 +1,30 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+
+  // Rename this to whatever you like — it becomes your relay's workers.dev
+  // subdomain (e.g. "my-relay" -> my-relay.<account>.workers.dev).
+  "name": "openchamber-relay",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-03-13",
+  "compatibility_flags": ["nodejs_compat"],
+
+  // The relay is one Durable Object per host instance (keyed by serverId).
+  "durable_objects": {
+    "bindings": [{ "name": "RELAY", "class_name": "RelayDurableObject" }]
+  },
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RelayDurableObject"] }],
+
+  // No secrets are required — the relay authenticates hosts with self-certifying
+  // signatures and never stores keys or reads traffic.
+  //
+  // OPTIONAL: per-server usage accounting. Uncomment and set your D1 database id
+  // (created with `wrangler d1 create openchamber-relay`), then apply the SQL in
+  // migrations/ with `wrangler d1 migrations apply <db-name> --remote`. Without
+  // this the relay runs fully; only the /usage endpoint and accounting are off.
+  //
+  // "d1_databases": [
+  //   { "binding": "DB", "database_name": "openchamber-relay", "database_id": "<your-d1-id>" }
+  // ],
+
+  "observability": { "enabled": true }
+}
