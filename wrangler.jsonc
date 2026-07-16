@@ -4,7 +4,7 @@
   // Rename this to whatever you like — it becomes your relay's workers.dev
   // subdomain (e.g. "my-relay" -> my-relay.<account>.workers.dev).
   "name": "openchamber-relay",
-  "main": "src/index.ts",
+  "main": "src/cloudflare/index.ts",
   "compatibility_date": "2025-03-13",
   "compatibility_flags": ["nodejs_compat"],
 

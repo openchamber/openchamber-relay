@@ -1,0 +1,40 @@
+# OpenChamber relay behind Caddy (automatic HTTPS via Let's Encrypt).
+#
+# 1. Point a DNS A/AAAA record (e.g. relay.example.com) at this machine.
+# 2. Set RELAY_DOMAIN below (or export it in the environment).
+# 3. docker compose up -d
+#
+# Your relay endpoint is then: wss://relay.example.com/ws
+# Health check:                https://relay.example.com/health
+
+services:
+  relay:
+    build: ..
+    # Or use a prebuilt image instead of build:
+    # image: ghcr.io/<your-org>/openchamber-relay:latest
+    restart: unless-stopped
+    environment:
+      # Optional: enable per-server usage accounting (SQLite on the volume below).
+      - RELAY_USAGE_DB=/data/usage.sqlite
+    volumes:
+      - relay-data:/data
+    expose:
+      - "8788"
+
+  caddy:
+    image: caddy:2-alpine
+    restart: unless-stopped
+    ports:
+      - "80:80"
+      - "443:443"
+    environment:
+      - RELAY_DOMAIN=${RELAY_DOMAIN:-relay.example.com}
+    volumes:
+      - caddy-data:/data
+      - caddy-config:/config
+    command: caddy reverse-proxy --from https://${RELAY_DOMAIN:-relay.example.com} --to http://relay:8788
+
+volumes:
+  relay-data:
+  caddy-data:
+  caddy-config:

@@ -1,0 +1,69 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Typecheck (both adapters)
+        run: npm run check
+      - uses: oven-sh/setup-bun@v2
+      - name: Unit tests
+        run: npm test
+
+  # The same smoke test is the conformance suite for both adapters.
+  smoke-node:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Start Node relay
+        run: |
+          RELAY_USAGE_DB=/tmp/usage.sqlite npm start &
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8788/health && break; sleep 1; done
+      - name: Smoke test
+        run: RELAY_URL=ws://127.0.0.1:8788 npm run smoke
+
+  smoke-cloudflare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: npm
+      - run: npm ci
+      - name: Start wrangler dev
+        run: |
+          npx wrangler dev src/cloudflare/index.ts --port 8788 &
+          for i in $(seq 1 60); do curl -sf http://127.0.0.1:8788/health && break; sleep 1; done
+      - name: Smoke test
+        run: RELAY_URL=ws://127.0.0.1:8788 npm run smoke
+
+  docker:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build image
+        run: docker build -t openchamber-relay:ci .
+      - name: Smoke test against the container
+        run: |
+          docker run -d --name relay -p 8788:8788 openchamber-relay:ci
+          for i in $(seq 1 30); do curl -sf http://127.0.0.1:8788/health && break; sleep 1; done
+          npm ci
+          RELAY_URL=ws://127.0.0.1:8788 npm run smoke
+          docker rm -f relay

@@ -18,7 +18,7 @@ import {
   utcUsageDate,
   zeroUsageDelta,
   type UsageRow,
-} from '../src/lib/usage-accumulator';
+} from '../src/core/usage-accumulator';
 
 const CAP = 512 * 1024 * 1024;
 

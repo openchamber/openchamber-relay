@@ -1,17 +1,19 @@
-// OpenChamber private relay worker — Layer 1 of the relay protocol.
-// Thin routing layer: validates the upgrade request and host auth, then hands the raw request
-// to the per-serverId Durable Object. Frame contents are never parsed or logged here.
+// OpenChamber private relay — Cloudflare Worker adapter (Layer 1 of the relay protocol).
+// Thin routing layer: validates the upgrade request and host auth (shared core logic), then
+// hands the raw request to the per-serverId Durable Object. Frame contents are never parsed
+// or logged here.
 
 import { Hono } from 'hono';
 import { z } from 'zod';
 import {
-  buildSignaturePayload,
   buildUsagePayload,
   deriveServerId,
   isFreshTimestamp,
   parsePublicKeyParam,
   verifySignature,
-} from './lib/relay-auth';
+} from '../core/relay-auth';
+import { HEALTH_BODY } from '../core/protocol';
+import { ID_PATTERN, validateWsUpgrade } from '../core/ws-query';
 import { RelayDurableObject } from './relay-do';
 
 export { RelayDurableObject };
@@ -23,25 +25,9 @@ type Env = {
   DB?: D1Database;
 };
 
-const ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
-
-const wsQuerySchema = z
-  .object({
-    v: z.literal('1'),
-    role: z.enum(['host-control', 'host-data', 'client']),
-    serverId: z.string().regex(ID_PATTERN),
-    connectionId: z.string().regex(ID_PATTERN).optional(),
-    ts: z.string().optional(),
-    sig: z.string().optional(),
-    pk: z.string().optional(),
-  })
-  .refine((query) => query.role !== 'host-data' || !!query.connectionId, {
-    message: 'connectionId is required for host-data',
-  });
-
 const app = new Hono<{ Bindings: Env }>();
 
-app.get('/health', (c) => c.json({ ok: true, service: 'openchamber-relay' }));
+app.get('/health', (c) => c.json(HEALTH_BODY));
 
 app.get('/ws', async (c) => {
   const upgrade = c.req.header('Upgrade');
@@ -49,46 +35,12 @@ app.get('/ws', async (c) => {
     return c.text('Expected WebSocket upgrade', 426);
   }
 
-  const parsed = wsQuerySchema.safeParse({
-    v: c.req.query('v'),
-    role: c.req.query('role'),
-    serverId: c.req.query('serverId'),
-    connectionId: c.req.query('connectionId') || undefined,
-    ts: c.req.query('ts') || undefined,
-    sig: c.req.query('sig') || undefined,
-    pk: c.req.query('pk') || undefined,
-  });
-  if (!parsed.success) {
-    return c.text('Invalid query parameters', 400);
-  }
-  const query = parsed.data;
-
-  // Host roles carry a signed handshake; clients connect without relay-level auth in v1
-  // (E2EE gates actual access). An optional `grant` param is reserved and ignored in v1.
-  if (query.role === 'host-control' || query.role === 'host-data') {
-    if (!query.ts || !query.sig || !query.pk) {
-      return c.text('Missing auth parameters', 401);
-    }
-    const ts = Number(query.ts);
-    if (!isFreshTimestamp(ts)) {
-      return c.text('Signature expired', 401);
-    }
-    const jwk = parsePublicKeyParam(query.pk);
-    if (!jwk) {
-      return c.text('Invalid public key', 403);
-    }
-    const expectedServerId = await deriveServerId(jwk);
-    if (expectedServerId !== query.serverId) {
-      return c.text('serverId mismatch', 403);
-    }
-    const payload = buildSignaturePayload(ts, query.serverId, query.role, query.connectionId);
-    const valid = await verifySignature(jwk, payload, query.sig);
-    if (!valid) {
-      return c.text('Invalid signature', 403);
-    }
+  const verdict = await validateWsUpgrade(new URL(c.req.url).searchParams);
+  if (!verdict.ok) {
+    return c.text(verdict.message, verdict.status as 400);
   }
 
-  const id = c.env.RELAY.idFromName(`relay-v1:${query.serverId}`);
+  const id = c.env.RELAY.idFromName(`relay-v1:${verdict.query.serverId}`);
   const stub = c.env.RELAY.get(id);
   return stub.fetch(c.req.raw);
 });

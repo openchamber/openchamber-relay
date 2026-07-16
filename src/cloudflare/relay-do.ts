@@ -15,7 +15,22 @@ import {
   utcUsageDate,
   zeroUsageDelta,
   type UsageDelta,
-} from './lib/usage-accumulator';
+} from '../core/usage-accumulator';
+import {
+  CLOSE_CONTROL_REPLACED,
+  CLOSE_DUPLICATE_CLIENT,
+  CLOSE_HOST_UNAVAILABLE,
+  CLOSE_LIMIT_EXCEEDED,
+  CLOSE_SERVICE_RESTART,
+  CLOSE_STUCK_CONTROL,
+  CONTROL_LOSS_GRACE_MS,
+  COUNTER_FLUSH_MS,
+  MAX_CLIENT_CONNECTS_PER_MIN,
+  MAX_CONCURRENT_CLIENTS,
+  PENDING_MAX_BYTES,
+  PENDING_MAX_FRAMES,
+  STUCK_CONTROL_MS,
+} from '../core/protocol';
 
 // The relay worker env visible to the DO. DB is the shared openchamber-metrics D1 (relay_* tables).
 export type Env = {
@@ -29,26 +44,9 @@ export type Env = {
 // Constants (per spec)
 // ---------------------------------------------------------------------------
 
-const CLOSE_CONTROL_REPLACED = 4001;
-const CLOSE_DUPLICATE_CLIENT = 4002;
-const CLOSE_STUCK_CONTROL = 4003;
-const CLOSE_HOST_UNAVAILABLE = 4008;
-const CLOSE_LIMIT_EXCEEDED = 4029;
-const CLOSE_SERVICE_RESTART = 1012;
-
-const PENDING_MAX_FRAMES = 200;
-const PENDING_MAX_BYTES = 2 * 1024 * 1024; // 2 MiB
-const STUCK_CONTROL_MS = 15_000;
-const CONTROL_LOSS_GRACE_MS = 30_000;
-const COUNTER_FLUSH_MS = 60_000;
-
 // Upper bound on unflushed-to-D1 traffic retained across failed flushes. Beyond this, a sustained
 // D1 outage would grow memory without limit, so we drop-with-log (loss is explicit, never silent).
 const D1_PENDING_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB
-
-// Abuse guards (the only limits enforced in v1; everything else goes through checkLimits).
-const MAX_CONCURRENT_CLIENTS = 16;
-const MAX_CLIENT_CONNECTS_PER_MIN = 60;
 
 // Tags
 const TAG_HOST_CONTROL = 'host-control';
