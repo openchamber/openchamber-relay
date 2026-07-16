@@ -14,8 +14,9 @@ WORKDIR /app
 
 ENV NODE_ENV=production
 COPY package.json package-lock.json ./
-# tsx is needed at runtime (the server runs from TypeScript sources), so install dev deps too.
-RUN npm ci --ignore-scripts
+# tsx is needed at runtime (the server runs from TypeScript sources), so install dev deps
+# too despite NODE_ENV=production.
+RUN npm ci --ignore-scripts --include=dev
 
 COPY tsconfig.base.json tsconfig.node.json ./
 COPY src/core ./src/core

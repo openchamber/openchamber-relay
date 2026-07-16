@@ -64,6 +64,9 @@ jobs:
         run: |
           docker run -d --name relay -p 8788:8788 openchamber-relay:ci
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8788/health && break; sleep 1; done
+          if ! curl -sf http://127.0.0.1:8788/health; then
+            echo "relay container failed to start:"; docker logs relay; exit 1
+          fi
           npm ci
           RELAY_URL=ws://127.0.0.1:8788 npm run smoke
           docker rm -f relay
