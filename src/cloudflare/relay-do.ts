@@ -153,13 +153,18 @@ export class RelayDurableObject implements DurableObject {
   // SEPARATE from counterDelta (which flushes to DO storage as lifetime totals) — the two are
   // incremented at the same call sites but reset on independent schedules, so D1 is never double
   // counted. Flushed to relay_daily_usage on the 60 s alarm and on last-socket close; kept and
-  // retried on failure. In-memory only, mirroring counterDelta: while sockets are live the DO does
-  // not hibernate, and the last-socket-close flush captures the tail before hibernation.
+  // retried on failure. In-memory only, mirroring counterDelta: any traffic arms a flush alarm
+  // within 60 s, and the last-socket-close flush captures the tail before hibernation. A DO that
+  // hibernates in that sub-minute window loses at most one minute of deltas (undercount, bounded).
   private d1Pending: UsageDelta = zeroUsageDelta();
 
   // serverId owning this DO. Captured on first connect, persisted (KEY_SERVER_ID) so the alarm can
   // attribute D1 writes with no socket in hand.
   private serverId: string | null = null;
+
+  // Whether we believe a flush alarm is currently set. In-memory only: reset to false by
+  // hibernation, which is exactly when the next message must re-check storage.getAlarm().
+  private flushAlarmEnsured = false;
 
   constructor(state: DurableObjectState, env: Env) {
     this.state = state;
@@ -344,6 +349,7 @@ export class RelayDurableObject implements DurableObject {
     // Count every message the DO receives (all roles) — this is the unit Cloudflare bills as a
     // Durable Object request. Do it before any role-based early return so control messages count too.
     recordMessage(this.d1Pending);
+    await this.ensureFlushAlarm();
     const { role, connectionId } = attachment;
 
     if (role === 'host-control') {
@@ -605,18 +611,34 @@ export class RelayDurableObject implements DurableObject {
     const stuck = await this.getStuckDeadlines();
     for (const deadline of Object.values(stuck)) deadlines.push(deadline);
 
-    // Keep waking on the flush cadence while there is live traffic, unflushed DO-storage counters,
-    // or unflushed-to-D1 usage (e.g. a failed D1 write that must be retried).
-    const hasSockets = this.state.getWebSockets().length > 0;
-    if (hasSockets || this.counterDeltaDirty || !isUsageDeltaEmpty(this.d1Pending)) {
+    // Keep waking on the flush cadence only while there is unflushed data: DO-storage counters,
+    // or unflushed-to-D1 usage (e.g. a failed D1 write that must be retried). Open-but-idle
+    // sockets deliberately do NOT hold an alarm — every wake defeats hibernation and bills
+    // compute duration, and an idle socket produces nothing to flush. Traffic that dirties the
+    // counters re-arms the alarm via ensureFlushAlarm() in webSocketMessage.
+    if (this.counterDeltaDirty || !isUsageDeltaEmpty(this.d1Pending)) {
       deadlines.push(Date.now() + COUNTER_FLUSH_MS);
     }
 
     if (deadlines.length === 0) {
       await this.state.storage.deleteAlarm();
+      this.flushAlarmEnsured = false;
       return;
     }
     await this.state.storage.setAlarm(Math.min(...deadlines));
+    this.flushAlarmEnsured = true;
+  }
+
+  // Cheap per-message guard: after hibernation (or after the alarm chain went quiet) the first
+  // frame must re-arm the flush alarm, otherwise dirty counters would sit in memory until a
+  // socket closes. The in-memory flag keeps this to one storage.getAlarm() per wake, not per frame.
+  private async ensureFlushAlarm(): Promise<void> {
+    if (this.flushAlarmEnsured) return;
+    this.flushAlarmEnsured = true;
+    const existing = await this.state.storage.getAlarm();
+    if (existing === null) {
+      await this.state.storage.setAlarm(Date.now() + COUNTER_FLUSH_MS);
+    }
   }
 
   // -------------------------------------------------------------------------
