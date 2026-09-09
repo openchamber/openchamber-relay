@@ -26,5 +26,6 @@
   //   { "binding": "DB", "database_name": "openchamber-relay", "database_id": "<your-d1-id>" }
   // ],
 
-  "observability": { "enabled": true }
+  // Sample invocation logs so per-frame Durable Object events do not overwhelm the log quota.
+  "observability": { "enabled": true, "head_sampling_rate": 0.01 }
 }

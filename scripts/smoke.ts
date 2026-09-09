@@ -1,7 +1,7 @@
-// Smoke test for the relay worker. Run against a local `wrangler dev`:
+// Smoke test for either relay adapter. Run against a local server:
 //
-//   bun run --cwd apps/relay dev          # terminal 1 (listens on :8788)
-//   bun run --cwd apps/relay smoke        # terminal 2
+//   npm run dev                          # terminal 1 (or npm run dev:node)
+//   npm run smoke                        # terminal 2
 //
 // Override the target with RELAY_URL=ws://127.0.0.1:8788 (no path).
 //
@@ -135,6 +135,12 @@ const main = async () => {
   const healthUrl = BASE.replace(/^ws/, 'http') + '/health';
   const health = (await (await fetch(healthUrl)).json()) as { ok: boolean; service: string };
   assert(health.ok === true && health.service === 'openchamber-relay', 'GET /health');
+
+  // Malformed URL encoding must be rejected without crashing the Node process.
+  // Cloudflare without D1 returns 503 before inspecting the serverId.
+  const malformedUsage = await fetch(BASE.replace(/^ws/, 'http') + '/usage/%');
+  assert([400, 503].includes(malformedUsage.status), 'malformed usage URL rejected');
+  assert((await fetch(healthUrl)).ok, 'relay remains healthy after malformed URL');
 
   const keys = await generateHostKeys();
 

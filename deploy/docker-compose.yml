@@ -11,7 +11,7 @@ services:
   relay:
     build: ..
     # Or use a prebuilt image instead of build:
-    # image: ghcr.io/<your-org>/openchamber-relay:latest
+    # image: ghcr.io/openchamber/openchamber-relay:latest
     restart: unless-stopped
     environment:
       # Optional: enable per-server usage accounting (SQLite on the volume below).

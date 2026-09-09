@@ -1,5 +1,5 @@
 # Publishes the relay image to GitHub Container Registry on tags (v*) and on main.
-# Pull with: docker pull ghcr.io/<owner>/openchamber-relay:latest
+# Pull with: docker pull ghcr.io/openchamber/openchamber-relay:latest
 
 name: Publish Docker image
 

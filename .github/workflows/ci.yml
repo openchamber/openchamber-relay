@@ -62,7 +62,9 @@ jobs:
         run: docker build -t openchamber-relay:ci .
       - name: Smoke test against the container
         run: |
-          docker run -d --name relay -p 8788:8788 openchamber-relay:ci
+          docker run -d --name relay -p 8788:8788 \
+            -e RELAY_USAGE_DB=/data/usage.sqlite \
+            -v relay-data:/data openchamber-relay:ci
           for i in $(seq 1 30); do curl -sf http://127.0.0.1:8788/health && break; sleep 1; done
           if ! curl -sf http://127.0.0.1:8788/health; then
             echo "relay container failed to start:"; docker logs relay; exit 1

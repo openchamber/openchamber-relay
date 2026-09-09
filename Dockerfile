@@ -29,6 +29,8 @@ EXPOSE 8788
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s \
   CMD wget -qO- http://127.0.0.1:8788/health || exit 1
 
+RUN mkdir -p /data && chown node:node /data
+
 USER node
 
 # Exec form + single process so SIGTERM reaches the server and the usage flush runs on shutdown.

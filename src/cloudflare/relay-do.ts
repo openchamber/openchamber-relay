@@ -669,12 +669,8 @@ export class RelayDurableObject implements DurableObject {
 
     const db = this.env.DB;
     if (!db) {
-      // No binding (e.g. local dev without D1). Don't accumulate unbounded — apply the cap.
-      const outcome = nextPendingAfterFlush(this.d1Pending, false, D1_PENDING_MAX_BYTES);
-      if (outcome.dropped) {
-        console.log('[relay] D1 usage dropped: no DB binding and pending exceeded cap');
-      }
-      this.d1Pending = outcome.pending;
+      // Accounting is disabled. There is no write to retry, so do not keep idle alarms alive.
+      this.d1Pending = zeroUsageDelta();
       return;
     }
 

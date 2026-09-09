@@ -12,7 +12,7 @@
     "dev:node": "tsx watch src/node/server.ts",
     "check": "tsc -p tsconfig.json --noEmit && tsc -p tsconfig.node.json --noEmit",
     "smoke": "tsx scripts/smoke.ts",
-    "test": "bun test scripts/usage-accumulator.test.ts"
+    "test": "bun test scripts/usage-accumulator.test.ts && node --import tsx --test scripts/relay-regressions.test.ts"
   },
   "dependencies": {
     "hono": "^4.7.5",

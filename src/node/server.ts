@@ -22,7 +22,6 @@ import {
   verifySignature,
 } from '../core/relay-auth';
 import { COUNTER_FLUSH_MS, HEALTH_BODY } from '../core/protocol';
-import { isUsageDeltaEmpty } from '../core/usage-accumulator';
 import { ID_PATTERN, validateWsUpgrade } from '../core/ws-query';
 import { RelayRoom } from './room';
 import { openUsageStore, type UsageStore } from './usage-store';
@@ -47,15 +46,14 @@ const getRoom = (serverId: string): RelayRoom => {
 // Periodic usage flush + empty-room eviction (the Node analogue of the DO's 60 s alarm).
 const flushTimer = setInterval(() => {
   for (const [serverId, room] of rooms) {
-    const delta = room.drainUsage();
-    if (usageStore && !isUsageDeltaEmpty(delta)) {
-      try {
-        usageStore.flush(serverId, delta);
-      } catch (error) {
-        console.log(
-          `[relay] usage flush failed serverId=${serverId}: ${error instanceof Error ? error.message : 'unknown'}`,
-        );
-      }
+    try {
+      room.flushUsage((delta) => usageStore?.flush(serverId, delta));
+    } catch (error) {
+      console.log(
+        `[relay] usage flush failed serverId=${serverId}: ${error instanceof Error ? error.message : 'unknown'}`,
+      );
+      // Keep the room and its counters for retry, even if every socket has closed.
+      continue;
     }
     if (room.isEmpty()) {
       room.dispose();
@@ -120,7 +118,7 @@ const handleUsage = async (
   sendJson(res, 200, { serverId, usage: usageStore.readUsage(serverId) });
 };
 
-const server = createServer((req: IncomingMessage, res: ServerResponse) => {
+const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise<void> => {
   const url = new URL(req.url ?? '/', 'http://relay.local');
 
   if (req.method === 'GET' && url.pathname === '/health') {
@@ -133,10 +131,28 @@ const server = createServer((req: IncomingMessage, res: ServerResponse) => {
   }
   const usageMatch = /^\/usage\/([^/]+)$/.exec(url.pathname);
   if (req.method === 'GET' && usageMatch) {
-    void handleUsage(decodeURIComponent(usageMatch[1]), url.searchParams, res);
+    let serverId: string;
+    try {
+      serverId = decodeURIComponent(usageMatch[1]);
+    } catch {
+      sendText(res, 400, 'Invalid serverId');
+      return;
+    }
+    await handleUsage(serverId, url.searchParams, res);
     return;
   }
   sendText(res, 404, 'Not found');
+};
+
+const server = createServer((req, res) => {
+  void handleRequest(req, res).catch((error) => {
+    console.log(`[relay] request failed: ${error instanceof Error ? error.message : 'unknown'}`);
+    if (res.headersSent) {
+      res.destroy();
+      return;
+    }
+    sendText(res, 500, 'Internal server error');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -210,13 +226,10 @@ const shutdown = (): void => {
   console.log('[relay] shutting down');
   clearInterval(flushTimer);
   for (const [serverId, room] of rooms) {
-    const delta = room.drainUsage();
-    if (usageStore && !isUsageDeltaEmpty(delta)) {
-      try {
-        usageStore.flush(serverId, delta);
-      } catch {
-        // best effort on shutdown
-      }
+    try {
+      room.flushUsage((delta) => usageStore?.flush(serverId, delta));
+    } catch {
+      // best effort on shutdown
     }
     room.dispose();
   }

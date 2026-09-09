@@ -26,6 +26,7 @@ import {
   STUCK_CONTROL_MS,
 } from '../core/protocol';
 import {
+  isUsageDeltaEmpty,
   recordConnect,
   recordFrameDown,
   recordFrameUp,
@@ -68,7 +69,7 @@ export class RelayRoom {
   // Rolling client-connect timestamps for the per-minute rate guard.
   private clientConnectTimes: number[] = [];
 
-  // Usage accumulated since the last drain (the server drains this into the usage store).
+  // Usage accumulated since the last successful synchronous write.
   usageDelta: UsageDelta = zeroUsageDelta();
 
   constructor(serverId: string) {
@@ -89,10 +90,10 @@ export class RelayRoom {
     }
   }
 
-  drainUsage(): UsageDelta {
-    const delta = this.usageDelta;
+  flushUsage(write: (delta: UsageDelta) => void): void {
+    if (isUsageDeltaEmpty(this.usageDelta)) return;
+    write(this.usageDelta);
     this.usageDelta = zeroUsageDelta();
-    return delta;
   }
 
   // ---------------------------------------------------------------------------
@@ -283,7 +284,6 @@ export class RelayRoom {
 
     const client = this.clients.get(connectionId);
     if (client) {
-      this.clients.delete(connectionId);
       safeClose(client, CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
     }
   }
@@ -298,10 +298,8 @@ export class RelayRoom {
       this.controlGraceTimer = setTimeout(() => {
         this.controlGraceTimer = null;
         if (this.control) return;
-        for (const [connectionId, client] of this.clients) {
-          this.clients.delete(connectionId);
-          this.pending.delete(connectionId);
-          this.clearStuckTimer(connectionId);
+        // Let onClientClose remove each client and close its paired host-data socket.
+        for (const client of this.clients.values()) {
           safeClose(client, CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
         }
       }, CONTROL_LOSS_GRACE_MS);

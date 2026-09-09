@@ -25,7 +25,7 @@ Both adapters implement the exact same wire protocol and pass the same conforman
 You need a free [Cloudflare account](https://dash.cloudflare.com/sign-up) and [Node](https://nodejs.org) (or Bun).
 
 ```sh
-git clone <this-repo> openchamber-relay && cd openchamber-relay
+git clone https://github.com/openchamber/openchamber-relay.git && cd openchamber-relay
 npm install
 npx wrangler login          # opens the browser once
 npx wrangler deploy         # deploys the worker
@@ -54,7 +54,7 @@ npx wrangler deploy
 
 ```sh
 docker run -d -p 8788:8788 --name openchamber-relay \
-  ghcr.io/<owner>/openchamber-relay:latest
+  ghcr.io/openchamber/openchamber-relay:latest
 ```
 
 Or build locally: `docker build -t openchamber-relay . && docker run -d -p 8788:8788 openchamber-relay`.
@@ -77,7 +77,7 @@ This image also runs as-is on any container platform — Fly.io, Railway, Render
 Requires Node ≥ 22.5.
 
 ```sh
-git clone <this-repo> openchamber-relay && cd openchamber-relay
+git clone https://github.com/openchamber/openchamber-relay.git && cd openchamber-relay
 npm install
 npm start                    # listens on 0.0.0.0:8788
 ```
@@ -114,7 +114,7 @@ The relay works fully without any database. With one bound (D1 on Cloudflare, SQ
 npm run dev        # Cloudflare adapter via wrangler dev (http://127.0.0.1:8788)
 npm run dev:node   # Node adapter with reload
 npm run check      # typecheck both adapters
-npm test           # unit tests (bun)
+npm test           # unit + regression tests (Bun and Node)
 npm run smoke      # conformance suite — run against either adapter:
                    #   RELAY_URL=ws://127.0.0.1:8788 npm run smoke
 ```
