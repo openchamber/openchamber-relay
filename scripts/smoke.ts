@@ -11,6 +11,7 @@
 // - frames buffered while host-data is absent, flushed in order when it attaches
 // - bidirectional verbatim forwarding of text and binary frames
 // - clean close propagation (client close -> host-data close + `disconnected` on control)
+// Runs all four combinations of legacy/current host and client metadata.
 
 const BASE = process.env.RELAY_URL ?? 'ws://127.0.0.1:8788';
 
@@ -53,6 +54,7 @@ const sign = async (privateKey: CryptoKey, payload: string): Promise<string> => 
 const hostWsUrl = async (
   keys: Awaited<ReturnType<typeof generateHostKeys>>,
   role: 'host-control' | 'host-data',
+  withMetadata: boolean,
   connectionId?: string,
   overrideSig?: string,
 ): Promise<string> => {
@@ -61,6 +63,11 @@ const hostWsUrl = async (
   const sig = overrideSig ?? (await sign(keys.privateKey, payload));
   const pk = textToB64url(JSON.stringify(keys.publicJwk));
   const params = new URLSearchParams({ v: '1', role, serverId: keys.serverId, ts: String(ts), sig, pk });
+  if (withMetadata) {
+    params.set('appId', 'openchamber');
+    params.set('appVersion', '1.23.0');
+    params.set('platform', 'desktop');
+  }
   if (connectionId) params.set('connectionId', connectionId);
   return `${BASE}/ws?${params}`;
 };
@@ -128,8 +135,8 @@ const assert = (condition: boolean, label: string): void => {
   console.log(`  ok: ${label}`);
 };
 
-const main = async () => {
-  console.log(`Relay smoke test against ${BASE}`);
+const runScenario = async (hostMetadata: boolean, clientMetadata: boolean) => {
+  console.log(`Relay smoke test against ${BASE}: host=${hostMetadata ? 'current' : 'legacy'}, client=${clientMetadata ? 'current' : 'legacy'}`);
 
   // Health
   const healthUrl = BASE.replace(/^ws/, 'http') + '/health';
@@ -146,13 +153,13 @@ const main = async () => {
 
   // 1. Auth rejection: garbage signature must not produce an open host socket.
   console.log('1. auth rejection');
-  const badSock = new Socket(await hostWsUrl(keys, 'host-control', undefined, textToB64url('garbage')));
+  const badSock = new Socket(await hostWsUrl(keys, 'host-control', hostMetadata, undefined, textToB64url('garbage')));
   const badResult = await withTimeout(badSock.openResult, 5000, 'bad-auth open');
   assert(badResult === 'failed', 'garbage signature rejected');
 
   // 2. Valid host-control connect, receives sync.
   console.log('2. host-control connect + sync');
-  const control = new Socket(await hostWsUrl(keys, 'host-control'));
+  const control = new Socket(await hostWsUrl(keys, 'host-control', hostMetadata));
   await control.open();
   const syncFrame = await control.nextFrame();
   assert(syncFrame.kind === 'text', 'sync is text');
@@ -163,6 +170,11 @@ const main = async () => {
   console.log('3. client connect + connected notification');
   const connectionId = `conn_${crypto.randomUUID().replace(/-/g, '').slice(0, 16)}`;
   const clientParams = new URLSearchParams({ v: '1', role: 'client', serverId: keys.serverId, connectionId });
+  if (clientMetadata) {
+    clientParams.set('appId', 'openchamber');
+    clientParams.set('appVersion', '1.23.0');
+    clientParams.set('platform', 'ios');
+  }
   const client = new Socket(`${BASE}/ws?${clientParams}`);
   await client.open();
   const connectedFrame = await control.nextFrame();
@@ -176,7 +188,7 @@ const main = async () => {
   client.ws.send('hello-3');
   await new Promise((resolve) => setTimeout(resolve, 300));
 
-  const hostData = new Socket(await hostWsUrl(keys, 'host-data', connectionId));
+  const hostData = new Socket(await hostWsUrl(keys, 'host-data', hostMetadata, connectionId));
   await hostData.open();
   const f1 = await hostData.nextFrame();
   const f2 = await hostData.nextFrame();
@@ -209,6 +221,14 @@ const main = async () => {
   assert(disconnected.type === 'disconnected' && disconnected.connectionId === connectionId, 'disconnected notification');
 
   control.close(1000, 'done');
+};
+
+const main = async () => {
+  for (const hostMetadata of [false, true]) {
+    for (const clientMetadata of [false, true]) {
+      await runScenario(hostMetadata, clientMetadata);
+    }
+  }
   console.log('\nAll smoke assertions passed.');
   process.exit(0);
 };

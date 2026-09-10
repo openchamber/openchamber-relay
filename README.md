@@ -89,7 +89,7 @@ Environment: `PORT` (default 8788), `HOST` (default 0.0.0.0), `RELAY_USAGE_DB` (
 On each machine that should be reachable through your relay, set the env var before starting OpenChamber:
 
 ```sh
-OPENCHAMBER_RELAY_URL="wss://relay.example.com/ws"
+export OPENCHAMBER_RELAY_URL="wss://relay.example.com/ws"
 ```
 
 That's all the server side needs. **Clients need no configuration** — when you enable the relay and generate a pairing QR/link in *Settings → Remote Instances*, the relay URL is embedded in it, so scanning devices automatically connect to your relay.
@@ -99,6 +99,11 @@ That's all the server side needs. **Clients need no configuration** — when you
 ## Usage accounting (optional, both adapters)
 
 The relay works fully without any database. With one bound (D1 on Cloudflare, SQLite elsewhere), it keeps per-server daily counters: bytes up/down, connects, peak concurrency, messages. A host can read its own usage from `GET /usage/<serverId>` (signed with its identity key). **No IPs or payloads are ever stored.**
+
+Newer OpenChamber apps send optional `appId`, `appVersion` and `platform` fields
+when connecting. Both self-hosted adapters ignore them. Older apps connect as
+before, and no extra database migration or app-specific accounting is needed.
+These fields do not change authentication and are not sent to OpenChamber.
 
 ## How it works (short version)
 
@@ -119,7 +124,11 @@ npm run smoke      # conformance suite — run against either adapter:
                    #   RELAY_URL=ws://127.0.0.1:8788 npm run smoke
 ```
 
-CI runs the same smoke suite against the Node server, `wrangler dev`, and the Docker image on every push.
+The smoke suite checks hosts and clients with and without app metadata,
+including mixed old/new connections. CI runs it against the Node server,
+`wrangler dev`, and the Docker image on pull requests. Pushes to `main` and
+`v*` tags run the same reusable CI workflow before publishing. Docker images
+are published only after every check passes for that same commit.
 
 ## License
 
