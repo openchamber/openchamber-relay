@@ -48,6 +48,13 @@ export type Env = {
 // D1 outage would grow memory without limit, so we drop-with-log (loss is explicit, never silent).
 const D1_PENDING_MAX_BYTES = 512 * 1024 * 1024; // 512 MiB
 
+// Two hosts holding the same identity (a copied data dir, a second machine, a container replica)
+// evict each other's control socket with 4001, and builds before the app's 4001 hold-off reconnect
+// within a second, so the pair trade the slot all day. Every connect wakes this object, so such a
+// pair kept it awake around the clock. Past the cap the connect is answered with a plain 429 and no
+// upgrade: the host sees a failed dial and its backoff grows to 30 s.
+const MAX_HOST_CONTROL_CONNECTS_PER_MIN = 10;
+
 // Tags
 const TAG_HOST_CONTROL = 'host-control';
 const TAG_HOST_DATA_PREFIX = 'host-data:';
@@ -74,6 +81,9 @@ type SocketAttachment = {
   connectionId: string | null;
   serverId: string;
   createdAt: number;
+  // Host control only: the app version it reported, and whether the relay has retired it.
+  appVersion?: string;
+  retired?: boolean;
 };
 
 export type UsageCounters = {
@@ -107,6 +117,33 @@ const frameByteSize = (message: string | ArrayBuffer): number =>
 const isRecord = (value: unknown): value is Record<string, unknown> =>
   typeof value === 'object' && value !== null;
 
+// Asks the peer to drop its socket instead of closing it from here. A close sent to a peer
+// that is gone (a phone asleep in a pocket, a laptop with its lid shut, a host's previous control
+// connection that the network dropped) holds the handler that sent it until the closing handshake
+// times out, minutes later, and the object is billed for the whole wait. Measured against a lab
+// copy of the hosted relay: six closes to gone clients kept the object awake ~900 s, six retire
+// frames ~1 s; a host whose connection was silently dropped cost ~190 s per reconnect when its
+// old control socket was closed, 0 s when it was retired. Tunnel clients and host data sockets
+// fail closed on any plaintext frame once the E2EE handshake is done, and hosts from 2.5.0 close
+// their control socket on it. Closes that stay closes: a duplicate client must get 4002, which
+// tells it not to reconnect; a replaced host data socket is one the host already dropped.
+const retireSocket = (ws: WebSocket, code: number, reason: string): void => {
+  try {
+    ws.send(JSON.stringify({ type: 'relay-retire', code, reason }));
+  } catch {
+    // Already closed: nothing to retire.
+  }
+};
+
+// Host builds from 2.5.0 close their control socket on a relay-retire frame; older builds ignore
+// unknown text on it.
+const understandsControlRetire = (appVersion: string | undefined): boolean => {
+  const match = /^(\d+)\.(\d+)\./.exec(appVersion ?? '');
+  if (!match) return false;
+  const major = Number(match[1]);
+  return major > 2 || (major === 2 && Number(match[2]) >= 5);
+};
+
 const readAttachment = (ws: WebSocket): SocketAttachment | null => {
   try {
     const raw: unknown = ws.deserializeAttachment();
@@ -118,6 +155,8 @@ const readAttachment = (ws: WebSocket): SocketAttachment | null => {
       connectionId: typeof raw.connectionId === 'string' ? raw.connectionId : null,
       serverId: typeof raw.serverId === 'string' ? raw.serverId : '',
       createdAt: typeof raw.createdAt === 'number' ? raw.createdAt : 0,
+      ...(typeof raw.appVersion === 'string' ? { appVersion: raw.appVersion } : {}),
+      ...(raw.retired === true ? { retired: true } : {}),
     };
   } catch {
     return null;
@@ -148,6 +187,7 @@ export class RelayDurableObject implements DurableObject {
   // Rolling client-connect timestamps for the per-minute rate guard. In-memory only: under
   // active connect churn the DO does not hibernate, so the window survives where it matters.
   private clientConnectTimes: number[] = [];
+  private hostControlConnectTimes: number[] = [];
 
   // Usage accumulated since the last *successful* D1 write (bytes_up/down, connects, peak). This is
   // SEPARATE from counterDelta (which flushes to DO storage as lifetime totals) — the two are
@@ -188,7 +228,7 @@ export class RelayDurableObject implements DurableObject {
 
     if (serverId) await this.rememberServerId(serverId);
 
-    if (role === 'host-control') return this.handleHostControlConnect(serverId);
+    if (role === 'host-control') return this.handleHostControlConnect(serverId, url.searchParams.get('appVersion') ?? undefined);
     if (role === 'host-data') return this.handleHostDataConnect(serverId, connectionId);
     if (role === 'client') return this.handleClientConnect(serverId, connectionId);
     return new Response('Invalid role', { status: 400 });
@@ -206,14 +246,22 @@ export class RelayDurableObject implements DurableObject {
     return new Response(null, { status: 101, webSocket: clientSide });
   }
 
-  private async handleHostControlConnect(serverId: string): Promise<Response> {
-    // Exactly one active host-control per serverId; a new one replaces the old.
-    for (const ws of this.state.getWebSockets(TAG_HOST_CONTROL)) {
-      try {
-        ws.close(CLOSE_CONTROL_REPLACED, 'Control replaced');
-      } catch {
-        // ignore
-      }
+  private async handleHostControlConnect(serverId: string, appVersion: string | undefined): Promise<Response> {
+    const now = Date.now();
+    this.hostControlConnectTimes = this.hostControlConnectTimes.filter((t) => now - t < 60_000);
+    if (this.hostControlConnectTimes.length >= MAX_HOST_CONTROL_CONNECTS_PER_MIN) {
+      console.log(`[relay] host-control rejected serverId=${serverId} status=429`);
+      return new Response('Too many host connects', { status: 429, headers: { 'Retry-After': '60' } });
+    }
+    this.hostControlConnectTimes.push(now);
+
+    // Exactly one active host-control per serverId; a new one replaces the old. The old one is
+    // usually the same host's previous connection, dropped by the network: the host gave up on it
+    // after a missed pong and dialed again. Retire it instead of closing it, every app version: an
+    // older build that is still alive ignores the frame and keeps an idle socket the relay no
+    // longer uses.
+    for (const ws of this.controlSockets()) {
+      this.retireControl(ws, CLOSE_CONTROL_REPLACED, 'Control replaced');
     }
     await this.state.storage.delete(KEY_CONTROL_GRACE);
 
@@ -221,13 +269,14 @@ export class RelayDurableObject implements DurableObject {
       role: 'host-control',
       connectionId: null,
       serverId,
-      createdAt: Date.now(),
+      createdAt: now,
+      ...(appVersion ? { appVersion } : {}),
     });
 
     console.log(`[relay] host-control connected serverId=${serverId}`);
 
     // Tell the host which clients are already waiting so it can attach data sockets.
-    const server = this.state.getWebSockets(TAG_HOST_CONTROL)[0];
+    const server = this.controlSockets()[0];
     if (server) {
       try {
         server.send(JSON.stringify({ type: 'sync', connectionIds: this.listClientConnectionIds() }));
@@ -405,11 +454,7 @@ export class RelayDurableObject implements DurableObject {
       if (flags[connectionId]) {
         console.log(`[relay] buffered frames lost to hibernation connectionId=${connectionId}`);
         await this.setBufferedFlag(connectionId, false);
-        try {
-          clientWs.close(CLOSE_SERVICE_RESTART, 'Buffered frames lost, reconnect');
-        } catch {
-          // ignore
-        }
+        retireSocket(clientWs, CLOSE_SERVICE_RESTART, 'Buffered frames lost, reconnect');
         return;
       }
       buffer = { frames: [], bytes: 0 };
@@ -422,11 +467,7 @@ export class RelayDurableObject implements DurableObject {
       console.log(`[relay] buffer overflow connectionId=${connectionId} code=${CLOSE_HOST_UNAVAILABLE}`);
       this.pending.delete(connectionId);
       await this.setBufferedFlag(connectionId, false);
-      try {
-        clientWs.close(CLOSE_HOST_UNAVAILABLE, 'host unavailable');
-      } catch {
-        // ignore
-      }
+      retireSocket(clientWs, CLOSE_HOST_UNAVAILABLE, 'host unavailable');
       return;
     }
 
@@ -442,11 +483,7 @@ export class RelayDurableObject implements DurableObject {
       // Frames were buffered before hibernation and are gone. Close the client so it retries.
       await this.setBufferedFlag(connectionId, false);
       for (const clientWs of this.state.getWebSockets(TAG_CLIENT_PREFIX + connectionId)) {
-        try {
-          clientWs.close(CLOSE_SERVICE_RESTART, 'Buffered frames lost, reconnect');
-        } catch {
-          // ignore
-        }
+        retireSocket(clientWs, CLOSE_SERVICE_RESTART, 'Buffered frames lost, reconnect');
       }
       return;
     }
@@ -473,6 +510,14 @@ export class RelayDurableObject implements DurableObject {
   // -------------------------------------------------------------------------
 
   async webSocketClose(ws: WebSocket, code: number, _reason: string, _wasClean: boolean): Promise<void> {
+    // Our compatibility date predates automatic close replies (2026-04-07).
+    // Complete the handshake before storage work or an attachment early return.
+    // Do not echo received codes such as 1005/1006, which cannot be sent.
+    try {
+      ws.close();
+    } catch {
+      // A transport failure may have already closed the socket; still clean up.
+    }
     const attachment = readAttachment(ws);
     if (!attachment) return;
     const { role, connectionId, serverId } = attachment;
@@ -492,11 +537,7 @@ export class RelayDurableObject implements DurableObject {
         await this.setBufferedFlag(connectionId, false);
         await this.clearStuckDeadline(connectionId);
         for (const hostWs of this.state.getWebSockets(TAG_HOST_DATA_PREFIX + connectionId)) {
-          try {
-            hostWs.close(1001, 'Client disconnected');
-          } catch {
-            // ignore
-          }
+          retireSocket(hostWs, 1001, 'Client disconnected');
         }
         this.notifyControl({ type: 'disconnected', connectionId });
       }
@@ -508,18 +549,14 @@ export class RelayDurableObject implements DurableObject {
         .some((socket) => socket !== ws);
       if (!remaining) {
         for (const clientWs of this.state.getWebSockets(TAG_CLIENT_PREFIX + connectionId)) {
-          try {
-            clientWs.close(CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
-          } catch {
-            // ignore
-          }
+          retireSocket(clientWs, CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
         }
       }
     }
 
     if (role === 'host-control') {
-      const remaining = this.state.getWebSockets(TAG_HOST_CONTROL).some((socket) => socket !== ws);
-      if (!remaining && this.countConcurrentClients() > 0) {
+      const remaining = this.controlSockets().some((socket) => socket !== ws);
+      if (!remaining && !attachment.retired && this.countConcurrentClients() > 0) {
         // Grace window: leave clients up awaiting control reconnect, then close them all.
         await this.state.storage.put(KEY_CONTROL_GRACE, Date.now() + CONTROL_LOSS_GRACE_MS);
       }
@@ -556,13 +593,9 @@ export class RelayDurableObject implements DurableObject {
     const grace = await this.state.storage.get<number>(KEY_CONTROL_GRACE);
     if (typeof grace === 'number' && now >= grace) {
       await this.state.storage.delete(KEY_CONTROL_GRACE);
-      if (this.state.getWebSockets(TAG_HOST_CONTROL).length === 0) {
+      if (this.controlSockets().length === 0) {
         for (const clientWs of this.state.getWebSockets(TAG_CLIENT)) {
-          try {
-            clientWs.close(CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
-          } catch {
-            // ignore
-          }
+          retireSocket(clientWs, CLOSE_SERVICE_RESTART, 'Host went away, reconnect');
         }
         this.pending.clear();
         await this.state.storage.delete(KEY_BUFFERED_FLAGS);
@@ -570,7 +603,7 @@ export class RelayDurableObject implements DurableObject {
       }
     }
 
-    // Stuck-control detection: client waiting > 15 s with no host-data -> close control 4003.
+    // Stuck-control detection: client waiting > 15 s with no host-data -> retire control 4003.
     const stuck = await this.getStuckDeadlines();
     let stuckChanged = false;
     for (const [connectionId, deadline] of Object.entries(stuck)) {
@@ -584,12 +617,26 @@ export class RelayDurableObject implements DurableObject {
       }
       if (now >= deadline) {
         console.log(`[relay] stuck control reset connectionId=${connectionId} code=${CLOSE_STUCK_CONTROL}`);
-        for (const controlWs of this.state.getWebSockets(TAG_HOST_CONTROL)) {
-          try {
-            controlWs.close(CLOSE_STUCK_CONTROL, 'Control unresponsive');
-          } catch {
-            // ignore
+        let retiredControl = false;
+        for (const controlWs of this.controlSockets()) {
+          // A control that never answered is usually gone, and closing a gone socket holds the
+          // object for minutes. Builds that ignore the retire frame still get the close: for
+          // them it is the only way to make a live but stuck host reconnect.
+          if (understandsControlRetire(readAttachment(controlWs)?.appVersion)) {
+            this.retireControl(controlWs, CLOSE_STUCK_CONTROL, 'Control unresponsive');
+            retiredControl = true;
+          } else {
+            try {
+              controlWs.close(CLOSE_STUCK_CONTROL, 'Control unresponsive');
+            } catch {
+              // ignore
+            }
           }
+        }
+        // A retired control sends no close event until its connection dies, so start the
+        // control-loss grace here, as its close would.
+        if (retiredControl && this.controlSockets().length === 0 && this.countConcurrentClients() > 0) {
+          await this.state.storage.put(KEY_CONTROL_GRACE, now + CONTROL_LOSS_GRACE_MS);
         }
         delete stuck[connectionId];
         stuckChanged = true;
@@ -797,9 +844,21 @@ export class RelayDurableObject implements DurableObject {
     return Array.from(out);
   }
 
+  // Host control sockets the relay still routes to. A retired one stays listed by the runtime until
+  // its connection closes, which for a dead one takes minutes.
+  private controlSockets(): WebSocket[] {
+    return this.state.getWebSockets(TAG_HOST_CONTROL).filter((ws) => !readAttachment(ws)?.retired);
+  }
+
+  private retireControl(ws: WebSocket, code: number, reason: string): void {
+    const attachment = readAttachment(ws);
+    if (attachment) ws.serializeAttachment({ ...attachment, retired: true });
+    retireSocket(ws, code, reason);
+  }
+
   private notifyControl(message: { type: string; connectionId?: string; connectionIds?: string[] }): void {
     const text = JSON.stringify(message);
-    for (const ws of this.state.getWebSockets(TAG_HOST_CONTROL)) {
+    for (const ws of this.controlSockets()) {
       try {
         ws.send(text);
       } catch {

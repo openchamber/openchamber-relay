@@ -142,3 +142,113 @@ test('Cloudflare with D1 still retries failed writes before stopping idle alarms
   assert.deepEqual(messages, [2]);
   assert.equal(alarm(), null);
 });
+
+// A close to a peer that is gone holds the Durable Object for minutes and is billed, so the
+// Cloudflare adapter asks peers to close themselves with a relay-retire frame.
+type FakeSocket = { ws: CloudflareSocket; sent: unknown[]; closed: number[]; attachment: () => unknown };
+type CloudflareSocket = Parameters<RelayDurableObject['webSocketClose']>[0];
+
+const fakeSocket = (attachment: Record<string, unknown>): FakeSocket => {
+  const sent: unknown[] = [];
+  const closed: number[] = [];
+  let current: unknown = attachment;
+  const ws = {
+    send: (data: string) => { sent.push(JSON.parse(data)); },
+    close: (code?: number) => { closed.push(code ?? 1000); },
+    deserializeAttachment: () => current,
+    serializeAttachment: (value: unknown) => { current = value; },
+  } as unknown as CloudflareSocket;
+  return { ws, sent, closed, attachment: () => current };
+};
+
+const durableObjectWith = (byTag: Record<string, CloudflareSocket[]>) => {
+  const values = new Map<string, unknown>();
+  const state = {
+    getWebSockets: (tag?: string) => (tag ? byTag[tag] ?? [] : [...new Set(Object.values(byTag).flat())]),
+    acceptWebSocket: (ws: CloudflareSocket, tags: string[]) => {
+      for (const tag of tags) (byTag[tag] ??= []).push(ws);
+    },
+    storage: {
+      get: async (key: string) => values.get(key),
+      put: async (key: string, value: unknown) => { values.set(key, value); },
+      delete: async (key: string) => values.delete(key),
+      getAlarm: async () => null,
+      setAlarm: async () => {},
+      deleteAlarm: async () => {},
+    },
+    waitUntil: () => {},
+  };
+  const relay = new RelayDurableObject(
+    state as unknown as ConstructorParameters<typeof RelayDurableObject>[0],
+    {},
+  );
+  return { relay, values };
+};
+
+const retire = (code: number, reason: string) => ({ type: 'relay-retire', code, reason });
+
+test('Cloudflare answers a peer close before reading the attachment', async () => {
+  const socket = fakeSocket({});
+  let closedFirst = false;
+  const ws = {
+    close: () => { socket.closed.push(1000); },
+    deserializeAttachment: () => { closedFirst = socket.closed.length === 1; return null; },
+  } as unknown as CloudflareSocket;
+  const { relay } = durableObjectWith({});
+  await relay.webSocketClose(ws, 1005, '', true);
+  assert.equal(closedFirst, true);
+});
+
+test('Cloudflare retires the client of a host data socket that went away', async () => {
+  const hostData = fakeSocket({ role: 'host-data', connectionId: 'c1', serverId: 's', createdAt: 1 });
+  const client = fakeSocket({ role: 'client', connectionId: 'c1', serverId: 's', createdAt: 1 });
+  const { relay } = durableObjectWith({ 'host-data:c1': [hostData.ws], 'client:c1': [client.ws], client: [client.ws] });
+  await relay.webSocketClose(hostData.ws, 1006, '', false);
+  assert.deepEqual(client.closed, []);
+  assert.deepEqual(client.sent, [retire(1012, 'Host went away, reconnect')]);
+});
+
+test('Cloudflare retires a replaced control socket and stops routing to it', async () => {
+  const old = fakeSocket({ role: 'host-control', connectionId: null, serverId: 's', createdAt: 1 });
+  const client = fakeSocket({ role: 'client', connectionId: 'c1', serverId: 's', createdAt: 1 });
+  const byTag: Record<string, CloudflareSocket[]> = { 'host-control': [old.ws], 'client:c1': [client.ws], client: [client.ws] };
+  const { relay, values } = durableObjectWith(byTag);
+  const handleConnect = (relay as unknown as { handleHostControlConnect: (serverId: string, appVersion?: string) => Promise<Response> }).handleHostControlConnect.bind(relay);
+  const pair = globalThis as unknown as { WebSocketPair?: unknown; Response: typeof Response };
+  const fresh = fakeSocket({});
+  pair.WebSocketPair = class { 0 = {}; 1 = fresh.ws; };
+  const realResponse = pair.Response;
+  pair.Response = class { constructor(public body: unknown, public init: unknown) {} } as unknown as typeof Response;
+  try {
+    await handleConnect('s', '2.5.0');
+  } finally {
+    pair.Response = realResponse;
+    delete pair.WebSocketPair;
+  }
+  assert.deepEqual(old.closed, []);
+  assert.deepEqual(old.sent, [retire(4001, 'Control replaced')]);
+  assert.equal((old.attachment() as { retired?: boolean }).retired, true);
+  assert.deepEqual(fresh.sent, [{ type: 'sync', connectionIds: ['c1'] }]);
+
+  // The retired socket's eventual close must not start the control-loss grace.
+  await relay.webSocketClose(old.ws, 1006, '', false);
+  assert.equal(values.has('controlGraceDeadline'), false);
+});
+
+test('Cloudflare retires a stuck control from 2.5.0 and still closes an older one', async () => {
+  for (const [appVersion, retired] of [['2.5.0', true], ['2.4.0', false]] as const) {
+    const control = fakeSocket({ role: 'host-control', connectionId: null, serverId: 's', createdAt: 1, appVersion });
+    const client = fakeSocket({ role: 'client', connectionId: 'c1', serverId: 's', createdAt: 1 });
+    const { relay, values } = durableObjectWith({ 'host-control': [control.ws], 'client:c1': [client.ws], client: [client.ws] });
+    values.set('stuckDeadlines', { c1: 0 });
+    await relay.alarm();
+    if (retired) {
+      assert.deepEqual(control.closed, []);
+      assert.deepEqual(control.sent, [retire(4003, 'Control unresponsive')]);
+      assert.equal(typeof values.get('controlGraceDeadline'), 'number');
+    } else {
+      assert.deepEqual(control.closed, [4003]);
+      assert.deepEqual(control.sent, []);
+    }
+  }
+});

@@ -11,6 +11,8 @@
 // - frames buffered while host-data is absent, flushed in order when it attaches
 // - bidirectional verbatim forwarding of text and binary frames
 // - clean close propagation (client close -> host-data close + `disconnected` on control)
+// Like the OpenChamber apps, every simulated socket closes itself on a `relay-retire` frame, which
+// the Cloudflare adapter sends instead of a close, and reports the frame's code as its close code.
 // Runs all four combinations of legacy/current host and client metadata.
 
 const BASE = process.env.RELAY_URL ?? 'ws://127.0.0.1:8788';
@@ -72,6 +74,16 @@ const hostWsUrl = async (
   return `${BASE}/ws?${params}`;
 };
 
+const parseRetire = (text: string): { code: number; reason: string } | null => {
+  try {
+    const message = JSON.parse(text) as { type?: unknown; code?: unknown; reason?: unknown };
+    if (message.type !== 'relay-retire' || typeof message.code !== 'number') return null;
+    return { code: message.code, reason: typeof message.reason === 'string' ? message.reason : '' };
+  } catch {
+    return null;
+  }
+};
+
 type Frame = { kind: 'text'; data: string } | { kind: 'binary'; data: Uint8Array };
 
 class Socket {
@@ -79,6 +91,7 @@ class Socket {
   frames: Frame[] = [];
   waiters: Array<() => void> = [];
   closed: Promise<{ code: number; reason: string }>;
+  retiredWith: { code: number; reason: string } | null = null;
   openResult: Promise<'open' | 'failed'>;
 
   constructor(url: string) {
@@ -91,11 +104,17 @@ class Socket {
     });
     this.closed = new Promise((resolve) => {
       this.ws.addEventListener('close', (event) =>
-        resolve({ code: event.code, reason: event.reason }),
+        resolve(this.retiredWith ?? { code: event.code, reason: event.reason }),
       );
     });
     this.ws.addEventListener('message', (event) => {
       if (typeof event.data === 'string') {
+        const retire = parseRetire(event.data);
+        if (retire) {
+          this.retiredWith = retire;
+          this.ws.close(1000);
+          return;
+        }
         this.frames.push({ kind: 'text', data: event.data });
       } else {
         this.frames.push({ kind: 'binary', data: new Uint8Array(event.data as ArrayBuffer) });
@@ -214,7 +233,8 @@ const runScenario = async (hostMetadata: boolean, clientMetadata: boolean) => {
   console.log('6. close propagation');
   client.close(1000, 'done');
   const hostDataClose = await withTimeout(hostData.closed, 5000, 'host-data close');
-  // The DO closes host-data with 1001; local wrangler dev may surface a normalized clean code.
+  // Host-data ends with 1001, a close (Node) or a retire frame (Cloudflare); local wrangler dev
+  // may surface a normalized clean code.
   assert(hostDataClose.code !== 1006, `host-data closed cleanly on client disconnect (code ${hostDataClose.code})`);
   const disconnectedFrame = await control.nextFrame();
   const disconnected = JSON.parse((disconnectedFrame as { data: string }).data) as { type: string; connectionId: string };
