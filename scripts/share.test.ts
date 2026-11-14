@@ -5,7 +5,7 @@
 
 import assert from 'node:assert/strict';
 import { spawn, type ChildProcess } from 'node:child_process';
-import { mkdtemp, readFile, readdir, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { request as httpRequest } from 'node:http';
 import { createServer } from 'node:net';
 import { tmpdir } from 'node:os';
@@ -395,6 +395,60 @@ for (const [name, makeHarness] of adapters) {
     });
   });
 }
+
+describe('Node share store under failing disk operations', () => {
+  const openStore = async (t: { after: (fn: () => Promise<void>) => void }) => {
+    const dir = await mkdtemp(join(tmpdir(), 'relay-shares-fail-'));
+    const store = await openFileShareStore({ dir, nudge: () => {} });
+    await store.sweep();
+    t.after(async () => {
+      store.close();
+      await rm(dir, { recursive: true, force: true });
+    });
+    const fetcher: Fetcher = (request) => Promise.resolve(shareApp.fetch(request, { shares: store.backend }));
+    return { dir, store, fetcher };
+  };
+
+  test('a failed write removes its temp file and reports the original error', async (t) => {
+    const { dir, store } = await openStore(t);
+    const id = 'C'.repeat(22);
+    // A non-empty directory where the blob goes makes the rename fail.
+    await mkdir(join(dir, `${id}.blob`));
+    await writeFile(join(dir, `${id}.blob`, 'keep'), 'x');
+    await assert.rejects(
+      store.backend.putBlob(id, new Uint8Array([1, 2, 3]).buffer),
+      (error: NodeJS.ErrnoException) => typeof error.code === 'string' && error.syscall === 'rename',
+    );
+    assert.deepEqual((await readdir(dir)).filter((name) => name.endsWith('.tmp')), []);
+  });
+
+  test('an expired page that cannot be deleted still leaves the answer readable', async (t) => {
+    const { dir, store, fetcher } = await openStore(t);
+    const host = await makeHost('https://relay.example.test', fetcher);
+    const { response, keys } = await createShare(host);
+    const { id, expiresAt } = await response.json() as { id: string; expiresAt: number };
+    const answer = await sealAnswer(keys.key, { v: 1, data: null, summary: 'ok' });
+    const answered = await fetcher(new Request(`https://relay.example.test/p/${id}/answer`, { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ auth: keys.auth, answer }) }));
+    assert.equal(answered.status, 200);
+    // Replace the blob with a non-empty directory: deleting it fails from now on.
+    await rm(join(dir, `${id}.blob`));
+    await mkdir(join(dir, `${id}.blob`));
+    await writeFile(join(dir, `${id}.blob`, 'keep'), 'x');
+
+    const states = await withClock(expiresAt + 1, async () => {
+      await store.sweep();
+      return (await (await host.call('POST', '/p/states', jsonBody({ ids: [id] }))).json()) as States;
+    });
+    assert.equal(states.states[0].status, 'answered');
+    assert.equal(states.states[0].answer, answer);
+
+    // Once the disk recovers, the sweep finishes the cleanup.
+    await rm(join(dir, `${id}.blob`), { recursive: true });
+    await writeFile(join(dir, `${id}.blob`), 'ciphertext');
+    await withClock(expiresAt + 1, () => store.sweep());
+    assert.ok(!(await readdir(dir)).includes(`${id}.blob`));
+  });
+});
 
 // ---------------------------------------------------------------------------
 // The real Node server: HTTP bridge, streamed limits, and shares surviving a restart.

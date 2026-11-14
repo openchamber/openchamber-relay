@@ -132,6 +132,8 @@ The routes, all under `/p`:
 - `POST /p`, `POST /p/states`, `POST /p/:id/close` — for the host that created the share, signed with the same identity key it uses for `/ws`.
 - `GET /p/:id` (the viewer page), `GET /p/:id/status`, `POST /p/:id/open`, `POST /p/:id/answer` — for the browser, gated by the PIN.
 
+Serve the relay at the root of its host: under a path prefix (`https://example.com/relay/ws`) share links break.
+
 When a share is opened or answered, the relay sends `{ "type": "share-state", "shareId" }` on the host's control socket so OpenChamber picks it up right away; without one it finds out on its next poll.
 
 ## How it works (short version)

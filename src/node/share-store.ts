@@ -59,21 +59,37 @@ export const openFileShareStore = async ({ dir, nudge, sweepMs = SHARE_SWEEP_MS 
   const recordPath = (id: string) => join(dir, `${id}.json`);
   const blobPath = (id: string) => join(dir, `${id}.blob`);
 
+  // Makes a rename in the directory durable. Some platforms cannot fsync a directory (EISDIR,
+  // EPERM, EINVAL, ...); there the rename stands without it rather than failing the write.
+  const syncDir = async (): Promise<void> => {
+    let handle;
+    try {
+      handle = await open(dir, 'r');
+      await handle.sync();
+    } catch {
+      // Unsupported here; nothing more to do.
+    } finally {
+      await handle?.close().catch(() => {});
+    }
+  };
+
   const writeAtomic = async (target: string, data: Uint8Array | string): Promise<void> => {
     const temp = join(dir, `.${randomBytes(8).toString('hex')}.tmp`);
-    const handle = await open(temp, 'w', 0o600);
     try {
-      await handle.writeFile(data);
-      await handle.sync();
-    } finally {
-      await handle.close();
-    }
-    try {
+      const handle = await open(temp, 'w', 0o600);
+      try {
+        await handle.writeFile(data);
+        await handle.sync();
+      } finally {
+        await handle.close();
+      }
       await rename(temp, target);
     } catch (error) {
+      // Whatever step failed, the temp file goes; the caller sees the original error.
       await rm(temp, { force: true }).catch(() => {});
       throw error;
     }
+    await syncDir();
   };
 
   const readRecord = async (id: string): Promise<ShareRecord | undefined> => {
@@ -94,6 +110,16 @@ export const openFileShareStore = async ({ dir, nudge, sweepMs = SHARE_SWEEP_MS 
 
   const deleteBlob = (id: string) => rm(blobPath(id), { force: true });
 
+  // Cleanup that must never fail the operation around it: a blob that cannot be deleted now is
+  // retried by the sweep.
+  const deleteBlobLater = async (id: string): Promise<void> => {
+    try {
+      await deleteBlob(id);
+    } catch (error) {
+      console.log(`[relay] share blob delete failed shareId=${id}, retrying on the next sweep: ${error instanceof Error ? error.message : 'unknown'}`);
+    }
+  };
+
   // Per-share queue: each operation starts after the previous one on the same share settles.
   const queues = new Map<string, Promise<void>>();
   const serialize = <T>(id: string, task: () => Promise<T>): Promise<T> => {
@@ -111,11 +137,12 @@ export const openFileShareStore = async ({ dir, nudge, sweepMs = SHARE_SWEEP_MS 
   const settle = async (record: ShareRecord, now: number): Promise<ShareRecord | undefined> => {
     const step = shareWakeStep(record, now);
     if (step.action === 'purge') {
-      await deleteBlob(record.id);
+      // A blob left behind here has no record anymore; the sweep removes it as an orphan.
+      await deleteBlobLater(record.id);
       await rm(recordPath(record.id), { force: true });
       return undefined;
     }
-    if (step.action === 'expire') await deleteBlob(record.id);
+    if (step.action === 'expire') await deleteBlobLater(record.id);
     return record;
   };
 
@@ -151,7 +178,7 @@ export const openFileShareStore = async ({ dir, nudge, sweepMs = SHARE_SWEEP_MS 
         if (outcome.write) {
           await writeAtomic(recordPath(id), JSON.stringify(outcome.write));
           // A failed delete is retried by the sweep at purge time.
-          if (outcome.deleteBlob) await deleteBlob(id).catch(() => {});
+          if (outcome.deleteBlob) await deleteBlobLater(id);
           if (outcome.nudge) {
             try {
               nudge(outcome.write.serverId, id);
