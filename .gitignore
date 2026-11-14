@@ -7,3 +7,4 @@ dist/
 *.sqlite
 *.sqlite-wal
 *.sqlite-shm
+data/

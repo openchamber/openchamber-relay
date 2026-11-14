@@ -8,11 +8,35 @@
   "compatibility_date": "2025-03-13",
   "compatibility_flags": ["nodejs_compat"],
 
-  // The relay is one Durable Object per host instance (keyed by serverId).
+  // The relay is one Durable Object per host instance (keyed by serverId). Encrypted shares
+  // (/p) add one Durable Object per share.
   "durable_objects": {
-    "bindings": [{ "name": "RELAY", "class_name": "RelayDurableObject" }]
+    "bindings": [
+      { "name": "RELAY", "class_name": "RelayDurableObject" },
+      { "name": "SHARE", "class_name": "ShareDurableObject" }
+    ]
   },
-  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["RelayDurableObject"] }],
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["RelayDurableObject"] },
+    { "tag": "v2", "new_sqlite_classes": ["ShareDurableObject"] }
+  ],
+
+  // Encrypted shares keep the page ciphertext here; the relay never sees a key. `wrangler deploy`
+  // creates the bucket on the first deploy when it does not exist yet; to create it yourself:
+  //
+  //   npx wrangler r2 bucket create openchamber-relay-shares
+  //
+  // Each share deletes its object when it is answered, withdrawn or expired. As a backstop for an
+  // upload whose share was never created, add a lifecycle rule that deletes objects under shares/
+  // after 15 days:
+  //
+  //   npx wrangler r2 bucket lifecycle add openchamber-relay-shares purge-shares shares/ --expire-days 15
+  "r2_buckets": [{ "binding": "SHARES", "bucket_name": "openchamber-relay-shares" }],
+
+  // OPTIONAL: the public origin share links use, e.g. a separate hostname routed to this worker.
+  // Without it links use the relay's own origin, which is what most setups want.
+  //
+  // "vars": { "SHARE_ORIGIN": "https://share.example.com" },
 
   // No secrets are required — the relay authenticates hosts with self-certifying
   // signatures and never stores keys or reads traffic.

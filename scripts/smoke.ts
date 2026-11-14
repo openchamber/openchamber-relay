@@ -14,8 +14,22 @@
 // Like the OpenChamber apps, every simulated socket closes itself on a `relay-retire` frame, which
 // the Cloudflare adapter sends instead of a close, and reports the frame's code as its close code.
 // Runs all four combinations of legacy/current host and client metadata.
+//
+// Then an encrypted share round trip: signed create, viewer, status, wrong PIN, open (with the
+// `share-state` nudge on host-control), answer, batched states, close.
+
+import {
+  DOCUMENT,
+  createShare,
+  deriveKeys,
+  jsonBody,
+  makeHost,
+  sealAnswer,
+  unseal,
+} from './share-helpers';
 
 const BASE = process.env.RELAY_URL ?? 'ws://127.0.0.1:8788';
+const HTTP_BASE = BASE.replace(/^ws/, 'http');
 
 const b64url = (buffer: ArrayBuffer): string => {
   const bytes = new Uint8Array(buffer);
@@ -243,12 +257,73 @@ const runScenario = async (hostMetadata: boolean, clientMetadata: boolean) => {
   control.close(1000, 'done');
 };
 
+const runShareScenario = async () => {
+  console.log(`Encrypted shares against ${HTTP_BASE}`);
+  const host = await makeHost(HTTP_BASE, (request) => fetch(request, { redirect: 'error' }));
+  const browser = (path: string, body?: unknown) => fetch(HTTP_BASE + path, body === undefined
+    ? { redirect: 'error' }
+    : { method: 'POST', redirect: 'error', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) });
+  const nextJson = async (socket: Socket) => {
+    const frame = await socket.nextFrame();
+    return frame.kind === 'text' ? JSON.parse(frame.data) as Record<string, unknown> : {};
+  };
+
+  // The live host learns about opens and answers on its control socket.
+  const control = new Socket(await hostWsUrl({ privateKey: host.privateKey, publicJwk: host.publicJwk, serverId: host.serverId }, 'host-control', true));
+  await control.open();
+  assert((await nextJson(control)).type === 'sync', 'share host control connected');
+
+  console.log('1. create (signed)');
+  const unsigned = await fetch(`${HTTP_BASE}/p`, { method: 'POST', body: new Uint8Array([1, 2, 3]) });
+  assert(unsigned.status === 401, 'unsigned create refused');
+  const { response, keys } = await createShare(host);
+  assert(response.status === 201, `share created (status ${response.status})`);
+  const { id, url } = await response.json() as { id: string; url: string };
+  assert(/^[A-Za-z0-9_-]{22}$/.test(id) && url.endsWith(`/p/${id}`), 'create returns id and link');
+
+  console.log('2. viewer + status');
+  const viewer = await browser(`/p/${id}`);
+  const csp = viewer.headers.get('content-security-policy') ?? '';
+  assert(viewer.status === 200 && csp.includes("frame-src 'none'") && csp.includes("connect-src 'self'"), 'viewer served with its CSP');
+  assert((await viewer.text()).includes('sandbox="allow-scripts allow-forms"'), 'viewer frames the page in a sandbox');
+  const status = await (await browser(`/p/${id}/status`)).json() as Record<string, unknown>;
+  assert(status.status === 'open' && status.attemptsLeft === 5, 'status open with five attempts');
+
+  console.log('3. wrong PIN, open');
+  const wrong = await deriveKeys(crypto.getRandomValues(new Uint8Array(32)), '000000');
+  const refused = await browser(`/p/${id}/open`, { auth: wrong.auth });
+  assert(refused.status === 403 && (await refused.json() as { error?: string }).error === 'wrong-pin', 'wrong PIN refused');
+  const opened = await browser(`/p/${id}/open`, { auth: keys.auth });
+  assert(opened.status === 200, 'right PIN opens');
+  const document = await unseal(keys.key, new Uint8Array(await opened.arrayBuffer()), 'openchamber-share-v1 document');
+  assert(JSON.stringify(document) === JSON.stringify(DOCUMENT), 'ciphertext decrypts to the shared page');
+  const openNudge = await nextJson(control);
+  assert(openNudge.type === 'share-state' && openNudge.shareId === id, 'host-control nudged on open');
+
+  console.log('4. answer, states, close');
+  const answer = await sealAnswer(keys.key, { v: 1, data: { pick: 'B' }, summary: 'Picked B' });
+  assert((await browser(`/p/${id}/answer`, { auth: keys.auth, answer })).status === 200, 'answer accepted');
+  assert((await browser(`/p/${id}/answer`, { auth: keys.auth, answer })).status === 409, 'second answer refused');
+  const answerNudge = await nextJson(control);
+  assert(answerNudge.type === 'share-state' && answerNudge.shareId === id, 'host-control nudged on answer');
+  const states = await (await host.call('POST', '/p/states', jsonBody({ ids: [id] }))).json() as { states: Array<Record<string, unknown>> };
+  assert(states.states[0]?.status === 'answered' && states.states[0]?.answer === answer, 'states carry the answer');
+  const closed = await (await host.call('POST', `/p/${id}/close`, jsonBody({}))).json() as Record<string, unknown>;
+  assert(closed.closed === true && closed.answer === answer, 'close hands over the answer');
+  assert((await browser(`/p/${id}/open`, { auth: keys.auth })).status === 409, 'closed share no longer opens');
+  const after = await (await browser(`/p/${id}/status`)).json() as Record<string, unknown>;
+  assert(after.status === 'answered', 'link reads as answered after close');
+
+  control.close(1000, 'done');
+};
+
 const main = async () => {
   for (const hostMetadata of [false, true]) {
     for (const clientMetadata of [false, true]) {
       await runScenario(hostMetadata, clientMetadata);
     }
   }
+  await runShareScenario();
   console.log('\nAll smoke assertions passed.');
   process.exit(0);
 };

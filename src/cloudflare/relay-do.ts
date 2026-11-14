@@ -31,6 +31,7 @@ import {
   PENDING_MAX_FRAMES,
   STUCK_CONTROL_MS,
 } from '../core/protocol';
+import { SHARE_STATE_PATH } from '../core/share/limits';
 
 // The relay worker env visible to the DO. DB is the shared openchamber-metrics D1 (relay_* tables).
 export type Env = {
@@ -216,6 +217,17 @@ export class RelayDurableObject implements DurableObject {
   // -------------------------------------------------------------------------
 
   async fetch(request: Request): Promise<Response> {
+    // Internal nudge from a ShareDurableObject: tell the live host that one of its shares was
+    // opened or answered, so it fetches the state now instead of on its next poll. Only another
+    // object can send this; the Worker forwards nothing but `/ws` upgrades here.
+    if (new URL(request.url).pathname === SHARE_STATE_PATH && request.method === 'POST') {
+      const body = (await request.json().catch(() => null)) as { shareId?: unknown } | null;
+      if (body && typeof body.shareId === 'string') {
+        this.notifyControl({ type: 'share-state', shareId: body.shareId });
+      }
+      return new Response(null, { status: 204 });
+    }
+
     const upgrade = request.headers.get('Upgrade');
     if (!upgrade || upgrade.toLowerCase() !== 'websocket') {
       return new Response('Expected WebSocket upgrade', { status: 426 });
@@ -856,7 +868,7 @@ export class RelayDurableObject implements DurableObject {
     retireSocket(ws, code, reason);
   }
 
-  private notifyControl(message: { type: string; connectionId?: string; connectionIds?: string[] }): void {
+  private notifyControl(message: { type: string; connectionId?: string; connectionIds?: string[]; shareId?: string }): void {
     const text = JSON.stringify(message);
     for (const ws of this.controlSockets()) {
       try {

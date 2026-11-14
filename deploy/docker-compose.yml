@@ -16,6 +16,10 @@ services:
     environment:
       # Optional: enable per-server usage accounting (SQLite on the volume below).
       - RELAY_USAGE_DB=/data/usage.sqlite
+      # Encrypted shares (ciphertext only) live on the same volume.
+      - RELAY_SHARE_DIR=/data/shares
+      # Optional: a different public origin for share links (default: the relay's own).
+      # - SHARE_ORIGIN=https://share.example.com
     volumes:
       - relay-data:/data
     expose:

@@ -23,7 +23,7 @@ const base64UrlToBytes = (value: string): ArrayBuffer => {
   return bytes.buffer;
 };
 
-const base64UrlFromBytes = (buffer: ArrayBuffer): string => {
+export const base64UrlFromBytes = (buffer: ArrayBuffer): string => {
   const bytes = new Uint8Array(buffer);
   let binary = '';
   for (let i = 0; i < bytes.length; i += 1) binary += String.fromCharCode(bytes[i]);
@@ -54,6 +54,18 @@ export const buildSignaturePayload = (
 // `${ts}.usage.${serverId}` with the same ECDSA key it uses for WS handshakes.
 export const buildUsagePayload = (ts: number, serverId: string): string =>
   `${ts}.usage.${serverId}`;
+
+// Signature payload for host calls to the share routes (`/p`). Binds the method, the path, the
+// SHA-256 of the body and the share metadata header, so a captured request can't be replayed
+// against another share or with another body.
+export const buildSharePayload = (
+  ts: number,
+  serverId: string,
+  method: string,
+  path: string,
+  bodySha256: string,
+  meta: string,
+): string => `${ts}.share.${serverId}.${method}.${path}.${bodySha256}.${meta}`;
 
 export const verifySignature = async (
   jwk: PublicKeyJwk,

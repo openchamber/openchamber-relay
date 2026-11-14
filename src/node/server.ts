@@ -1,18 +1,23 @@
 // OpenChamber private relay — standalone Node adapter (Layer 1 of the relay protocol).
 // A single long-lived process holding one RelayRoom per serverId. Same wire contract as the
-// Cloudflare Worker adapter: /health, /ws (validated + host-authenticated upgrades), and an
-// optional signed /usage/:serverId read backed by SQLite instead of D1.
+// Cloudflare Worker adapter: /health, /ws (validated + host-authenticated upgrades), an
+// optional signed /usage/:serverId read backed by SQLite instead of D1, and encrypted shares
+// (/p) stored as files instead of Durable Objects + R2.
 //
 // Configuration (env):
 //   PORT            listen port (default 8788)
 //   HOST            bind address (default 0.0.0.0)
 //   RELAY_USAGE_DB  path to a SQLite file to enable usage accounting (optional)
+//   RELAY_SHARE_DIR directory for encrypted shares (default: shares/ next to RELAY_USAGE_DB,
+//                   else ./data/shares)
+//   SHARE_ORIGIN    public origin for share links (optional; default: the origin the host called)
 //
 // Run behind a TLS-terminating reverse proxy (Caddy, Traefik, nginx) — OpenChamber hosts and
 // clients connect over wss://.
 
 import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
 import { randomUUID } from 'node:crypto';
+import { dirname, join, resolve } from 'node:path';
 import { WebSocketServer } from 'ws';
 import {
   buildUsagePayload,
@@ -23,7 +28,10 @@ import {
 } from '../core/relay-auth';
 import { COUNTER_FLUSH_MS, HEALTH_BODY } from '../core/protocol';
 import { ID_PATTERN, validateWsUpgrade } from '../core/ws-query';
+import { isSharePath, shareApp } from '../core/share/routes';
+import { sendWebResponse, toWebRequest } from './http-bridge';
 import { RelayRoom } from './room';
+import { openFileShareStore, type FileShareStore } from './share-store';
 import { openUsageStore, type UsageStore } from './usage-store';
 
 const PORT = Number(process.env.PORT ?? 8788);
@@ -42,6 +50,24 @@ const getRoom = (serverId: string): RelayRoom => {
   }
   return room;
 };
+
+const SHARE_DIR = resolve(
+  process.env.RELAY_SHARE_DIR ||
+    (process.env.RELAY_USAGE_DB ? join(dirname(process.env.RELAY_USAGE_DB), 'shares') : join('data', 'shares')),
+);
+const SHARE_ORIGIN = process.env.SHARE_ORIGIN || undefined;
+
+// A share opened or answered nudges the owner's live control socket. Only an existing room can
+// have one; a share never creates a room.
+const shareStore: FileShareStore | null = await openFileShareStore({
+  dir: SHARE_DIR,
+  nudge: (serverId, shareId) => rooms.get(serverId)?.notifyShareState(shareId),
+}).catch((error: unknown) => {
+  console.log(
+    `[relay] encrypted shares disabled: cannot use ${SHARE_DIR} (${error instanceof Error ? error.message : 'unknown'})`,
+  );
+  return null;
+});
 
 // Periodic usage flush + empty-room eviction (the Node analogue of the DO's 60 s alarm).
 const flushTimer = setInterval(() => {
@@ -127,6 +153,15 @@ const handleRequest = async (req: IncomingMessage, res: ServerResponse): Promise
   }
   if (req.method === 'GET' && url.pathname === '/ws') {
     sendText(res, 426, 'Expected WebSocket upgrade');
+    return;
+  }
+  if (isSharePath(url.pathname)) {
+    if (!shareStore) {
+      sendText(res, 503, 'Encrypted shares are not available on this relay');
+      return;
+    }
+    const response = await shareApp.fetch(toWebRequest(req), { shares: shareStore.backend, SHARE_ORIGIN });
+    await sendWebResponse(req, res, response);
     return;
   }
   const usageMatch = /^\/usage\/([^/]+)$/.exec(url.pathname);
@@ -219,12 +254,14 @@ server.listen(PORT, HOST, () => {
       ? `[relay] usage accounting enabled (${process.env.RELAY_USAGE_DB})`
       : '[relay] usage accounting disabled (set RELAY_USAGE_DB to enable)',
   );
+  if (shareStore) console.log(`[relay] encrypted shares stored in ${SHARE_DIR}`);
 });
 
 // Graceful shutdown: flush usage, then exit.
 const shutdown = (): void => {
   console.log('[relay] shutting down');
   clearInterval(flushTimer);
+  shareStore?.close();
   for (const [serverId, room] of rooms) {
     try {
       room.flushUsage((delta) => usageStore?.flush(serverId, delta));

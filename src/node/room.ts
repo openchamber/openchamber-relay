@@ -335,7 +335,13 @@ export class RelayRoom {
     }
   }
 
-  private notifyControl(message: { type: string; connectionId?: string }): void {
+  // A share of this host was opened or answered: tell the live host to fetch its state now
+  // instead of on its next poll. Without a control socket the host polls anyway.
+  notifyShareState(shareId: string): void {
+    this.notifyControl({ type: 'share-state', shareId });
+  }
+
+  private notifyControl(message: { type: string; connectionId?: string; shareId?: string }): void {
     if (!this.control) return;
     try {
       this.control.send(JSON.stringify(message));

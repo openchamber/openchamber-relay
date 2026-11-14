@@ -14,12 +14,19 @@ import {
 } from '../core/relay-auth';
 import { HEALTH_BODY } from '../core/protocol';
 import { ID_PATTERN, validateWsUpgrade } from '../core/ws-query';
+import { shareApp } from '../core/share/routes';
 import { RelayDurableObject } from './relay-do';
+import { ShareDurableObject, cloudflareShareBackend } from './share-do';
 
-export { RelayDurableObject };
+export { RelayDurableObject, ShareDurableObject };
 
 type Env = {
   RELAY: DurableObjectNamespace;
+  // Encrypted shares (/p): one Durable Object per share and an R2 bucket for the ciphertext.
+  SHARE: DurableObjectNamespace;
+  SHARES: R2Bucket;
+  // Optional public origin for share links; without it links use the origin the host called.
+  SHARE_ORIGIN?: string;
   // Optional: bind a D1 database (+ apply migrations/) to enable per-server usage
   // accounting and the /usage endpoint. The relay runs fully without it.
   DB?: D1Database;
@@ -100,5 +107,11 @@ app.get('/usage/:serverId', async (c) => {
 
   return c.json({ serverId, usage: result.results ?? [] });
 });
+
+// Encrypted shares: pages a host hands to another person by link and PIN (src/core/share).
+const handleShare = (c: { req: { raw: Request }; env: Env }) =>
+  shareApp.fetch(c.req.raw, { shares: cloudflareShareBackend(c.env), SHARE_ORIGIN: c.env.SHARE_ORIGIN });
+app.all('/p', handleShare);
+app.all('/p/*', handleShare);
 
 export default app;

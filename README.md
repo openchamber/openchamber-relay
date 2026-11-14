@@ -31,6 +31,8 @@ npx wrangler login          # opens the browser once
 npx wrangler deploy         # deploys the worker
 ```
 
+The first deploy also creates the R2 bucket `openchamber-relay-shares` for [encrypted shares](#encrypted-shares). If your wrangler doesn't create it, run `npx wrangler r2 bucket create openchamber-relay-shares` once and deploy again.
+
 `wrangler deploy` prints your relay URL, e.g. `https://openchamber-relay.<your-account>.workers.dev`. Your relay WebSocket endpoint is that host with `/ws` and the `wss://` scheme:
 
 ```
@@ -68,7 +70,9 @@ RELAY_DOMAIN=relay.example.com docker compose up -d
 
 Your endpoint: `wss://relay.example.com/ws`. Health: `https://relay.example.com/health`.
 
-**Optional usage accounting (SQLite):** set `RELAY_USAGE_DB=/data/usage.sqlite` and mount a volume at `/data` (the compose file already does this).
+**Mount a volume at `/data`** (the compose file already does): [encrypted shares](#encrypted-shares) are stored in `/data/shares`, and without a volume they are lost when the container is replaced.
+
+**Optional usage accounting (SQLite):** set `RELAY_USAGE_DB=/data/usage.sqlite`; it goes on the same volume.
 
 This image also runs as-is on any container platform — Fly.io, Railway, Render, Kubernetes (probe `/health`).
 
@@ -82,7 +86,7 @@ npm install
 npm start                    # listens on 0.0.0.0:8788
 ```
 
-Environment: `PORT` (default 8788), `HOST` (default 0.0.0.0), `RELAY_USAGE_DB` (path to a SQLite file; enables usage accounting). Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik) in front and forward `/ws`, `/health`, `/usage/*` to it — WebSocket upgrade support required.
+Environment: `PORT` (default 8788), `HOST` (default 0.0.0.0), `RELAY_USAGE_DB` (path to a SQLite file; enables usage accounting), `RELAY_SHARE_DIR` (where [encrypted shares](#encrypted-shares) are stored; default `shares/` next to `RELAY_USAGE_DB`, else `./data/shares`), `SHARE_ORIGIN` (optional public origin for share links). Put a TLS-terminating reverse proxy (Caddy, nginx, Traefik) in front and forward `/ws`, `/health`, `/usage/*` and `/p` with everything under it — WebSocket upgrade support required.
 
 ## Point OpenChamber at your relay
 
@@ -105,11 +109,36 @@ when connecting. Both self-hosted adapters ignore them. Older apps connect as
 before, and no extra database migration or app-specific accounting is needed.
 These fields do not change authentication and are not sent to OpenChamber.
 
+## Encrypted shares
+
+OpenChamber can send a page to someone by link and PIN: a questionnaire an agent wants a colleague to fill in, for example. The person opens the link in any browser, enters the PIN, sees the page and can send one answer back. The share goes through the relay your OpenChamber uses, so with a self-hosted relay it never leaves your infrastructure. Both adapters support it out of the box.
+
+**The relay only stores ciphertext.** OpenChamber encrypts the page before uploading it. The key is in the link's `#fragment`, which browsers never send to a server, and the browser combines it with the PIN to decrypt. The relay keeps a hash of a value derived from the key and the PIN, enough to count wrong PINs (five, then the link locks) and nothing more. The answer is encrypted the same way. Neither the relay nor anyone who reads its storage can see a page or an answer.
+
+Shares are cleaned up on their own: the page is deleted when the host collects the answer, withdraws the share or the share expires (at most 7 days). A small record stays a week longer so the link can say "answered" or "withdrawn" instead of "not found".
+
+Where shares live:
+
+| | Storage |
+|---|---|
+| Cloudflare | One Durable Object per share for its state, the encrypted page in the R2 bucket `openchamber-relay-shares`. `wrangler deploy` creates the bucket; as a backstop for uploads that never became a share, add a lifecycle rule: `npx wrangler r2 bucket lifecycle add openchamber-relay-shares purge-shares shares/ --expire-days 15` |
+| Docker | Files in `/data/shares`. Mount a volume at `/data` |
+| Node | Files in `RELAY_SHARE_DIR` (default `./data/shares`). Two files per share, written atomically; a sweep every 15 minutes removes what expired |
+
+**Share links** use the relay's own origin by default: `https://relay.example.com/p/<id>#<key>`. To hand out links on another hostname that reaches the same relay, set `SHARE_ORIGIN=https://share.example.com` (a `vars` entry in `wrangler.jsonc`, an environment variable on Docker/Node). Behind a reverse proxy the Node adapter builds links from `X-Forwarded-Proto` and `X-Forwarded-Host`; if your proxy rewrites the host, set `SHARE_ORIGIN`.
+
+The routes, all under `/p`:
+
+- `POST /p`, `POST /p/states`, `POST /p/:id/close` — for the host that created the share, signed with the same identity key it uses for `/ws`.
+- `GET /p/:id` (the viewer page), `GET /p/:id/status`, `POST /p/:id/open`, `POST /p/:id/answer` — for the browser, gated by the PIN.
+
+When a share is opened or answered, the relay sends `{ "type": "share-state", "shareId" }` on the host's control socket so OpenChamber picks it up right away; without one it finds out on its next poll.
+
 ## How it works (short version)
 
 - One relay "room" per host instance, keyed by a self-certifying `serverId` (the hash of the host's public key). Hosts authenticate with a signed handshake; no accounts, no stored secrets. On Cloudflare a room is a Durable Object; on Node it's an in-memory object in a single long-lived process.
 - Frames are forwarded verbatim and never parsed or logged. Confidentiality and integrity are provided end-to-end by the OpenChamber client and host, not by the relay.
-- The protocol core (`src/core/`) — handshake validation, auth, accounting — is shared; `src/cloudflare/` and `src/node/` are thin adapters over it.
+- The protocol core (`src/core/`) — handshake validation, auth, accounting, the share routes, state machine and viewer — is shared; `src/cloudflare/` and `src/node/` are thin adapters over it.
 
 **Scaling note (Node adapter):** one process holds all rooms in memory. That comfortably covers a team — the relay only forwards frames. Running multiple instances would require routing by `serverId` (sticky hashing); if you need that, open an issue.
 
@@ -119,13 +148,13 @@ These fields do not change authentication and are not sent to OpenChamber.
 npm run dev        # Cloudflare adapter via wrangler dev (http://127.0.0.1:8788)
 npm run dev:node   # Node adapter with reload
 npm run check      # typecheck both adapters
-npm test           # unit + regression tests (Bun and Node)
+npm test           # unit, regression and share tests (Bun and Node)
 npm run smoke      # conformance suite — run against either adapter:
                    #   RELAY_URL=ws://127.0.0.1:8788 npm run smoke
 ```
 
 The smoke suite checks hosts and clients with and without app metadata,
-including mixed old/new connections. CI runs it against the Node server,
+including mixed old/new connections, and an encrypted share round trip. CI runs it against the Node server,
 `wrangler dev`, and the Docker image on pull requests. Pushes to `main` and
 `v*` tags run the same reusable CI workflow before publishing. Docker images
 are published only after every check passes for that same commit.
